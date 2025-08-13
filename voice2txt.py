@@ -17,8 +17,10 @@ from dotenv import load_dotenv
 import customtkinter as ctk
 import json
 import pyautogui
+
 try:
     from pynput.mouse import Controller as MouseController
+
     PYNPUT_AVAILABLE = True
 except ImportError:
     PYNPUT_AVAILABLE = False
@@ -56,12 +58,12 @@ stream = None
 model = None
 gpt_client = None
 settings_window = None
-is_settings_window_open = False
 prompt_configs = {}
 processing_mode = "Коррекция"
 selected_index = 0
 recording_thread = None
 processing_thread = None
+
 
 # --- Функции ---
 
@@ -78,9 +80,11 @@ def load_prompts(file_path: str) -> dict:
         logging.error(f"Ошибка декодирования JSON в файле: {file_path}")
         return {}
 
+
 def play_sound_async(sound_name: str):
     """Воспроизводит звук в отдельном потоке-демоне."""
     sound_path = os.path.join(ASSETS_DIR, sound_name)
+
     def target():
         try:
             playsound(sound_path)
@@ -90,6 +94,7 @@ def play_sound_async(sound_name: str):
     # Поток-демон завершится, если основная программа остановится
     sound_thread = threading.Thread(target=target, daemon=True)
     sound_thread.start()
+
 
 def process_text_with_gpt(text: str) -> str:
     """Processes the given text using the GPT model based on the current processing_mode."""
@@ -120,20 +125,22 @@ def process_text_with_gpt(text: str) -> str:
         logging.error(f"Ошибка во время обработки текста через GPT: {e}", exc_info=True)
         return text
 
+
 def paste_text(text: str):
     """Копирует текст в буфер и симулирует вставку (Ctrl+V или Cmd+V)."""
     try:
         pyperclip.copy(text)
-        time.sleep(0.1) # Пауза для буфера обмена
+        time.sleep(0.1)  # Пауза для буфера обмена
 
         logging.debug("Отправка команды вставки...")
-        pyautogui.hotkey('ctrl', 'v') # Для Windows/Linux
+        pyautogui.hotkey('ctrl', 'v')  # Для Windows/Linux
         # Примечание: для macOS pyautogui автоматически преобразует 'ctrl' в 'command'
 
         logging.debug("Команда вставки отправлена.")
 
     except Exception as e:
         logging.error(f"Ошибка при копировании/вставке: {e}", exc_info=True)
+
 
 def audio_callback(indata, frames, time, status):
     """Callback для аудиоданных."""
@@ -143,6 +150,7 @@ def audio_callback(indata, frames, time, status):
         # Оставляем предупреждение, т.к. это важно
         logging.warning(f"Статус аудиопотока: {status}")
     audio_queue.put(indata.copy())
+
 
 def start_recording_thread_target():
     """Целевая функция для потока старта записи."""
@@ -156,9 +164,10 @@ def start_recording_thread_target():
             except queue.Empty:
                 break
 
-    logging.info("Начало записи...") # <--- INFO: Ключевое событие
+    logging.info("Начало записи...")  # <--- INFO: Ключевое событие
     try:
-        logging.debug(f"Используем устройство: {'по умолчанию' if TARGET_DEVICE_INDEX is None else f'индекс {TARGET_DEVICE_INDEX}'}")
+        logging.debug(
+            f"Используем устройство: {'по умолчанию' if TARGET_DEVICE_INDEX is None else f'индекс {TARGET_DEVICE_INDEX}'}")
         stream = sd.InputStream(
             device=TARGET_DEVICE_INDEX,
             samplerate=SAMPLE_RATE,
@@ -167,16 +176,21 @@ def start_recording_thread_target():
             callback=audio_callback
         )
         stream.start()
-        logging.debug("Аудиопоток запущен.") # <--- DEBUG: Техническая деталь
+        logging.debug("Аудиопоток запущен.")  # <--- DEBUG: Техническая деталь
     except Exception as e:
-        logging.error(f"Ошибка при старте InputStream: {e}", exc_info=True) # <--- ERROR: Важно
+        logging.error(f"Ошибка при старте InputStream: {e}", exc_info=True)  # <--- ERROR: Важно
         is_recording = False
         if stream:
-             try: stream.stop()
-             except: pass
-             try: stream.close()
-             except: pass
+            try:
+                stream.stop()
+            except:
+                pass
+            try:
+                stream.close()
+            except:
+                pass
         stream = None
+
 
 def stop_recording_and_transcribe_thread_target():
     """Целевая функция для потока остановки и обработки."""
@@ -267,12 +281,48 @@ def stop_recording_and_transcribe_thread_target():
         logging.debug("Поток обработки завершен.")
 
 
-def open_settings_window():
-    """Создает и управляет окном настроек, реализуя навигацию и подсветку."""
-    global settings_window, processing_mode, is_settings_window_open, selected_index
+def show_settings_window():
+    """Shows the existing settings window at the cursor's position."""
+    global settings_window
+    if not settings_window:
+        return
 
-    if is_settings_window_open: return
-    is_settings_window_open = True
+    # --- Интеллектуальное позиционирование ---
+    WIN_WIDTH = 400
+    WIN_HEIGHT = 350
+
+    if PYNPUT_AVAILABLE:
+        try:
+            screen_width = settings_window.winfo_screenwidth()
+            screen_height = settings_window.winfo_screenheight()
+            mouse_controller = MouseController()
+            mouse_x, mouse_y = mouse_controller.position
+
+            if mouse_x + WIN_WIDTH > screen_width:
+                final_x = mouse_x - WIN_WIDTH - 20
+            else:
+                final_x = mouse_x + 20
+
+            if mouse_y + WIN_HEIGHT > screen_height:
+                final_y = mouse_y - WIN_HEIGHT - 20
+            else:
+                final_y = mouse_y + 20
+
+            final_x = max(0, final_x)
+            final_y = max(0, final_y)
+            settings_window.geometry(f"{WIN_WIDTH}x{WIN_HEIGHT}+{final_x}+{final_y}")
+        except Exception as e:
+            logging.warning(f"Не удалось обновить позицию окна, оно появится в прежнем месте: {e}")
+
+    # --- Показываем и фокусируемся ---
+    settings_window.deiconify()
+    settings_window.lift()
+    settings_window.focus_force()
+
+
+def create_settings_window():
+    """Создает и управляет окном настроек, реализуя навигацию и подсветку."""
+    global settings_window, processing_mode, selected_index
 
     # --- 1. Создание и позиционирование окна ---
     window = ctk.CTk()
@@ -293,15 +343,15 @@ def open_settings_window():
 
             # 2. Рассчитываем финальную позицию X
             if mouse_x + WIN_WIDTH > screen_width:
-                final_x = mouse_x - WIN_WIDTH - 20 # Появляется слева
+                final_x = mouse_x - WIN_WIDTH - 20  # Появляется слева
             else:
-                final_x = mouse_x + 20 # Появляется справа
+                final_x = mouse_x + 20  # Появляется справа
 
             # 3. Рассчитываем финальную позицию Y
             if mouse_y + WIN_HEIGHT > screen_height:
-                final_y = mouse_y - WIN_HEIGHT - 20 # Появляется сверху
+                final_y = mouse_y - WIN_HEIGHT - 20  # Появляется сверху
             else:
-                final_y = mouse_y + 20 # Появляется снизу
+                final_y = mouse_y + 20  # Появляется снизу
 
             # 4. Применяем геометрию, гарантируя, что окно не уходит за левый/верхний край
             final_x = max(0, final_x)
@@ -320,10 +370,9 @@ def open_settings_window():
 
     # --- 2. Централизованная функция закрытия ---
     def on_closing():
-        global is_settings_window_open, settings_window
-        is_settings_window_open = False
-        settings_window = None # Важно обнулить ссылку
-        window.destroy()
+        logging.debug("Прячем окно настроек.")
+        window.withdraw()  # Прячем, а не уничтожаем
+
     window.protocol("WM_DELETE_WINDOW", on_closing)
 
     # --- 3. Логика подсветки и навигации ---
@@ -354,7 +403,7 @@ def open_settings_window():
         global processing_mode
         processing_mode = mode_name
         logging.info(f"Режим изменен на '{mode_name}'.")
-        on_closing()
+        on_closing()  # Вызываем общую функцию, которая спрячет окно
 
     def handle_key_press(event):
         global selected_index
@@ -419,6 +468,7 @@ def on_press(key):
     except Exception as e:
         logging.error(f"Unhandled exception in on_press: {e}", exc_info=True)
 
+
 def on_release(key):
     """Handles key release events from the listener."""
     try:
@@ -436,7 +486,8 @@ def on_f9_press():
     if not is_recording:
         play_sound_async('start.wav')
         is_recording = True
-        recording_thread = threading.Thread(target=start_recording_thread_target, name="RecordingStartThread", daemon=True)
+        recording_thread = threading.Thread(target=start_recording_thread_target, name="RecordingStartThread",
+                                            daemon=True)
         recording_thread.start()
         # Добавляем минимальную задержку для предотвращения гонки состояний
         time.sleep(0.1)
@@ -451,22 +502,28 @@ def on_f9_release():
     if is_recording:
         play_sound_async('stop.wav')
         is_recording = False
-        processing_thread = threading.Thread(target=stop_recording_and_transcribe_thread_target, name="ProcessingThread", daemon=True)
+        processing_thread = threading.Thread(target=stop_recording_and_transcribe_thread_target,
+                                             name="ProcessingThread", daemon=True)
         processing_thread.start()
     else:
         logging.debug("Отпускание F9: Запись не шла, игнорируем.")
 
+
 def on_f10_press():
-    """Обработчик НАЖАТИЯ F10 для открытия окна настроек."""
-    global is_settings_window_open
-    logging.debug("Событие НАЖАТИЯ F10 обнаружено.")
+    """Handles F10 key press to open or show the settings window."""
+    global settings_window
 
-    if is_settings_window_open:
-        logging.debug("Окно настроек уже открыто, игнорируем.")
-        return
+    if settings_window is None:
+        # Если окно еще не создано, запускаем поток для его создания
+        logging.debug("F10: Окно не создано, запускаем создание...")
+        settings_thread = threading.Thread(target=create_settings_window, name="SettingsWindowThread", daemon=True)
+        settings_thread.start()
+    else:
+        # Если окно уже существует (просто спрятано), показываем его
+        logging.debug("F10: Окно существует, показываем его...")
+        # Используем .after() для потокобезопасного вызова
+        settings_window.after(0, show_settings_window)
 
-    settings_thread = threading.Thread(target=open_settings_window, name="SettingsWindowThread", daemon=True)
-    settings_thread.start()
 
 # --- Основная часть ---
 if __name__ == "__main__":
@@ -528,26 +585,27 @@ if __name__ == "__main__":
 
     logging.info(f"=== Скрипт готов. F9 - запись голоса, F10 - настройки. ===")
     if SAVE_AUDIO_FOR_DEBUG or FORCE_FP32 or TARGET_DEVICE_INDEX is not None:
-         logging.info(f"--- Активные отладочные настройки: SAVE_AUDIO={SAVE_AUDIO_FOR_DEBUG}, FORCE_FP32={FORCE_FP32}, DEVICE_INDEX={TARGET_DEVICE_INDEX} ---") # <--- INFO (только если есть)
-    logging.info("=== Чтобы остановить скрипт, нажмите Ctrl+C в консоли. ===") # <--- INFO
+        logging.info(
+            f"--- Активные отладочные настройки: SAVE_AUDIO={SAVE_AUDIO_FOR_DEBUG}, FORCE_FP32={FORCE_FP32}, DEVICE_INDEX={TARGET_DEVICE_INDEX} ---")  # <--- INFO (только если есть)
+    logging.info("=== Чтобы остановить скрипт, нажмите Ctrl+C в консоли. ===")  # <--- INFO
 
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
-        logging.info("Получен сигнал KeyboardInterrupt. Завершение работы...") # <--- INFO
+        logging.info("Получен сигнал KeyboardInterrupt. Завершение работы...")  # <--- INFO
     except Exception as e:
-        logging.exception(f"Непредвиденная ошибка в главном цикле: {e}") # <--- ERROR
+        logging.exception(f"Непредвиденная ошибка в главном цикле: {e}")  # <--- ERROR
     finally:
         logging.info("Завершение: Остановка слушателя клавиатуры...")
         listener.stop()
         if is_recording and stream:
-            logging.warning("Завершение: Принудительная остановка аудиопотока...") # <--- WARNING
+            logging.warning("Завершение: Принудительная остановка аудиопотока...")  # <--- WARNING
             is_recording = False
             try:
                 stream.stop()
                 stream.close()
-                logging.info("Завершение: Аудиопоток принудительно остановлен.") # <--- INFO
+                logging.info("Завершение: Аудиопоток принудительно остановлен.")  # <--- INFO
             except Exception as e:
-                 logging.error(f"Завершение: Ошибка при принудительной остановке потока: {e}") # <--- ERROR
-        logging.info("=== Скрипт остановлен. ===") # <--- INFO
+                logging.error(f"Завершение: Ошибка при принудительной остановке потока: {e}")  # <--- ERROR
+        logging.info("=== Скрипт остановлен. ===")  # <--- INFO
