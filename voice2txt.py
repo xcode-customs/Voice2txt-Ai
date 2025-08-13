@@ -1,0 +1,553 @@
+import sounddevice as sd
+import numpy as np
+import soundfile as sf
+import whisper
+import torch
+from pynput import keyboard
+import threading
+import queue
+import time
+import tempfile
+import os
+import logging
+import openai
+import pyperclip
+from playsound import playsound
+from dotenv import load_dotenv
+import customtkinter as ctk
+import json
+import pyautogui
+try:
+    from pynput.mouse import Controller as MouseController
+    PYNPUT_AVAILABLE = True
+except ImportError:
+    PYNPUT_AVAILABLE = False
+
+load_dotenv()
+
+# --- Настройка ---
+ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+PROMPT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prompts.json")
+HOTKEY = 'f9'
+SETTINGS_HOTKEY = 'f10'
+SAMPLE_RATE = 16000
+CHANNELS = 1
+MODEL_SIZE = "small"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+OPENAI_API_BASE = os.environ.get("OPENAI_API_BASE")
+GPT_MODEL = "gpt-4.1-mini"
+# --- Новые настройки для отладки ---
+SAVE_AUDIO_FOR_DEBUG = True
+FORCE_FP32 = True
+TARGET_DEVICE_INDEX = None
+
+# --- Настройка логирования (Уровень INFO по умолчанию) ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] (%(threadName)s) %(message)s',
+    handlers=[logging.StreamHandler()]
+)
+
+# --- Глобальные переменные ---
+audio_queue = queue.Queue()
+is_recording = False
+stream = None
+model = None
+gpt_client = None
+settings_window = None
+is_settings_window_open = False
+prompt_configs = {}
+processing_mode = "Коррекция"
+selected_index = 0
+recording_thread = None
+processing_thread = None
+
+# --- Функции ---
+
+def load_prompts(file_path: str) -> dict:
+    """Loads prompts from a JSON file."""
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            prompts = json.load(f)
+            return prompts
+    except FileNotFoundError:
+        logging.error(f"Файл с промптами не найден: {file_path}")
+        return {}
+    except json.JSONDecodeError:
+        logging.error(f"Ошибка декодирования JSON в файле: {file_path}")
+        return {}
+
+def play_sound_async(sound_name: str):
+    """Воспроизводит звук в отдельном потоке-демоне."""
+    sound_path = os.path.join(ASSETS_DIR, sound_name)
+    def target():
+        try:
+            playsound(sound_path)
+        except Exception as e:
+            logging.warning(f"Не удалось воспроизвести звук '{sound_path}': {e}")
+
+    # Поток-демон завершится, если основная программа остановится
+    sound_thread = threading.Thread(target=target, daemon=True)
+    sound_thread.start()
+
+def process_text_with_gpt(text: str) -> str:
+    """Processes the given text using the GPT model based on the current processing_mode."""
+    if not gpt_client:
+        logging.warning("Клиент OpenAI не инициализирован. Пропуск обработки GPT.")
+        return text
+
+    system_prompt = prompt_configs.get(processing_mode)
+    if not system_prompt:
+        logging.warning(f"Промпт для режима '{processing_mode}' не найден. Пропуск обработки GPT.")
+        return text
+
+    try:
+        response = gpt_client.chat.completions.create(
+            model=GPT_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": text},
+            ],
+            temperature=0,
+            max_tokens=2048
+        )
+
+        processed_text = response.choices[0].message.content.strip()
+        return processed_text
+
+    except Exception as e:
+        logging.error(f"Ошибка во время обработки текста через GPT: {e}", exc_info=True)
+        return text
+
+def paste_text(text: str):
+    """Копирует текст в буфер и симулирует вставку (Ctrl+V или Cmd+V)."""
+    try:
+        pyperclip.copy(text)
+        time.sleep(0.1) # Пауза для буфера обмена
+
+        logging.debug("Отправка команды вставки...")
+        pyautogui.hotkey('ctrl', 'v') # Для Windows/Linux
+        # Примечание: для macOS pyautogui автоматически преобразует 'ctrl' в 'command'
+
+        logging.debug("Команда вставки отправлена.")
+
+    except Exception as e:
+        logging.error(f"Ошибка при копировании/вставке: {e}", exc_info=True)
+
+def audio_callback(indata, frames, time, status):
+    """Callback для аудиоданных."""
+    if not is_recording:
+        return
+    if status:
+        # Оставляем предупреждение, т.к. это важно
+        logging.warning(f"Статус аудиопотока: {status}")
+    audio_queue.put(indata.copy())
+
+def start_recording_thread_target():
+    """Целевая функция для потока старта записи."""
+    global stream, audio_queue, is_recording
+    qsize = audio_queue.qsize()
+    if qsize > 0:
+        logging.debug(f"Очистка очереди перед записью (было {qsize} элементов)")
+        while not audio_queue.empty():
+            try:
+                audio_queue.get_nowait()
+            except queue.Empty:
+                break
+
+    logging.info("Начало записи...") # <--- INFO: Ключевое событие
+    try:
+        logging.debug(f"Используем устройство: {'по умолчанию' if TARGET_DEVICE_INDEX is None else f'индекс {TARGET_DEVICE_INDEX}'}")
+        stream = sd.InputStream(
+            device=TARGET_DEVICE_INDEX,
+            samplerate=SAMPLE_RATE,
+            channels=CHANNELS,
+            dtype='float32',
+            callback=audio_callback
+        )
+        stream.start()
+        logging.debug("Аудиопоток запущен.") # <--- DEBUG: Техническая деталь
+    except Exception as e:
+        logging.error(f"Ошибка при старте InputStream: {e}", exc_info=True) # <--- ERROR: Важно
+        is_recording = False
+        if stream:
+             try: stream.stop()
+             except: pass
+             try: stream.close()
+             except: pass
+        stream = None
+
+def stop_recording_and_transcribe_thread_target():
+    """Целевая функция для потока остановки и обработки."""
+    global stream, audio_queue, model
+    logging.info("Обработка записи...")
+
+    active_stream = stream
+    stream = None
+
+    if active_stream:
+        logging.debug("Остановка аудиопотока...")
+        try:
+            time.sleep(0.1)
+            active_stream.stop()
+            active_stream.close()
+            logging.debug("Аудиопоток остановлен и закрыт.")
+        except Exception as e:
+            logging.error(f"Ошибка при остановке/закрытии потока: {e}", exc_info=True)
+    else:
+        logging.warning("Объект потока не найден при попытке остановки.")
+
+    audio_data = []
+    while not audio_queue.empty():
+        try:
+            audio_data.append(audio_queue.get_nowait())
+        except queue.Empty:
+            break
+
+    if not audio_data:
+        logging.warning("Нет аудио данных для обработки.")
+        return
+
+    try:
+        full_audio_float32 = np.concatenate(audio_data, axis=0)
+        full_audio_int16 = (full_audio_float32 * 32767).astype(np.int16)
+    except ValueError as e:
+        logging.error(f"Ошибка при объединении или конвертации аудио: {e}. Пропускаем.", exc_info=True)
+        return
+
+    final_path_to_use = None
+    temp_file_context = None
+
+    try:
+        # --- ШАГ 1: Сохранение аудио в файл ---
+        if SAVE_AUDIO_FOR_DEBUG:
+            debug_audio_path = os.path.join(os.getcwd(), "last_recording_debug.wav")
+            final_path_to_use = debug_audio_path
+            logging.info(f"Сохранение отладочного аудио в: {final_path_to_use}")
+            sf.write(final_path_to_use, full_audio_int16, SAMPLE_RATE, subtype='PCM_16')
+        else:
+            temp_file_context = tempfile.NamedTemporaryFile(suffix=".wav", delete=True, mode='wb')
+            tmpfile = temp_file_context.__enter__()
+            final_path_to_use = tmpfile.name
+            logging.debug(f"Сохранение аудио во временный файл: {final_path_to_use}")
+            sf.write(final_path_to_use, full_audio_int16, SAMPLE_RATE, subtype='PCM_16')
+            tmpfile.flush()
+
+        # --- ШАГ 2: ЕДИНЫЙ блок распознавания и обработки ---
+        if final_path_to_use and model:
+            logging.info("Распознавание речи...")
+            start_time = time.time()
+            use_fp16 = (DEVICE == 'cuda') and (not FORCE_FP32)
+            logging.debug(f"Запуск Whisper с fp16={use_fp16}")
+            result = model.transcribe(final_path_to_use, fp16=use_fp16)
+            end_time = time.time()
+            recognized_text = result["text"].strip()
+            logging.info(f"Распознавание завершено за {end_time - start_time:.2f} сек.")
+
+            if recognized_text:
+                logging.info(f"Распознанный текст: '{recognized_text}'")
+                logging.info(f"Обработка текста с помощью GPT в режиме '{processing_mode}'...")
+                processed_text = process_text_with_gpt(recognized_text)
+                logging.info(f"Обработанный текст: '{processed_text}'")
+                paste_text(processed_text)
+            else:
+                logging.warning("Распознан пустой текст.")
+                if SAVE_AUDIO_FOR_DEBUG:
+                    logging.warning(f"Аудиозапись сохранена в '{final_path_to_use}' для проверки.")
+
+        elif not model:
+            logging.error("Модель Whisper не загружена!")
+
+    except Exception as e:
+        logging.exception(f"Непредвиденная ошибка в потоке обработки: {e}")
+    finally:
+        if temp_file_context:
+            temp_file_context.__exit__(None, None, None)
+        logging.debug("Поток обработки завершен.")
+
+
+def open_settings_window():
+    """Создает и управляет окном настроек, реализуя навигацию и подсветку."""
+    global settings_window, processing_mode, is_settings_window_open, selected_index
+
+    if is_settings_window_open: return
+    is_settings_window_open = True
+
+    # --- 1. Создание и позиционирование окна ---
+    window = ctk.CTk()
+    window.title("Настройки")
+
+    # --- Интеллектуальное позиционирование ---
+    WIN_WIDTH = 400
+    WIN_HEIGHT = 350
+
+    # Позиционирование у мыши (с проверкой на наличие pynput)
+    if PYNPUT_AVAILABLE:
+        try:
+            # 1. Получаем размеры экрана и позицию мыши
+            screen_width = window.winfo_screenwidth()
+            screen_height = window.winfo_screenheight()
+            mouse_controller = MouseController()
+            mouse_x, mouse_y = mouse_controller.position
+
+            # 2. Рассчитываем финальную позицию X
+            if mouse_x + WIN_WIDTH > screen_width:
+                final_x = mouse_x - WIN_WIDTH - 20 # Появляется слева
+            else:
+                final_x = mouse_x + 20 # Появляется справа
+
+            # 3. Рассчитываем финальную позицию Y
+            if mouse_y + WIN_HEIGHT > screen_height:
+                final_y = mouse_y - WIN_HEIGHT - 20 # Появляется сверху
+            else:
+                final_y = mouse_y + 20 # Появляется снизу
+
+            # 4. Применяем геометрию, гарантируя, что окно не уходит за левый/верхний край
+            final_x = max(0, final_x)
+            final_y = max(0, final_y)
+            window.geometry(f"{WIN_WIDTH}x{WIN_HEIGHT}+{final_x}+{final_y}")
+
+        except Exception as e:
+            logging.warning(f"Не удалось получить координаты мыши, окно появится по центру: {e}")
+            window.geometry(f"{WIN_WIDTH}x{WIN_HEIGHT}")
+    else:
+        # Fallback to center if pynput is not available
+        window.geometry(f"{WIN_WIDTH}x{WIN_HEIGHT}")
+
+    window.attributes("-topmost", True)
+    settings_window = window
+
+    # --- 2. Централизованная функция закрытия ---
+    def on_closing():
+        global is_settings_window_open, settings_window
+        is_settings_window_open = False
+        settings_window = None # Важно обнулить ссылку
+        window.destroy()
+    window.protocol("WM_DELETE_WINDOW", on_closing)
+
+    # --- 3. Логика подсветки и навигации ---
+    buttons = []
+    try:
+        DEFAULT_COLOR = ctk.ThemeManager.theme["CTkButton"]["fg_color"]
+        ACCENT_COLOR = ctk.ThemeManager.theme["CTkButton"]["hover_color"]
+    except (KeyError, AttributeError):
+        logging.warning("Не удалось получить цвета из темы. Используются цвета по умолчанию.")
+        DEFAULT_COLOR = ("#3a7ebf", "#1f538d")
+        ACCENT_COLOR = "#36719F"
+
+    def update_selection(new_index):
+        global selected_index
+        if not buttons: return
+
+        for i, btn in enumerate(buttons):
+            if i == new_index:
+                btn.configure(fg_color=ACCENT_COLOR)
+            else:
+                btn.configure(fg_color=DEFAULT_COLOR)
+
+        selected_index = new_index
+        buttons[selected_index].focus_set()
+
+    # --- 4. Функция выбора и обработчики клавиш ---
+    def select_mode(mode_name):
+        global processing_mode
+        processing_mode = mode_name
+        logging.info(f"Режим изменен на '{mode_name}'.")
+        on_closing()
+
+    def handle_key_press(event):
+        global selected_index
+        if not buttons: return
+
+        if event.keysym == 'Down':
+            update_selection((selected_index + 1) % len(buttons))
+        elif event.keysym == 'Up':
+            update_selection((selected_index - 1 + len(buttons)) % len(buttons))
+        elif event.keysym == 'Return':
+            buttons[selected_index].invoke()
+        elif event.keysym == 'Escape':
+            on_closing()
+
+    window.bind("<Up>", handle_key_press)
+    window.bind("<Down>", handle_key_press)
+    window.bind("<Return>", handle_key_press)
+    window.bind("<Escape>", handle_key_press)
+
+    # --- 5. Создание виджетов ---
+    scrollable_frame = ctk.CTkScrollableFrame(window, fg_color="transparent")
+    scrollable_frame.pack(fill="both", expand=True, padx=5, pady=5)
+
+    mode_keys = list(prompt_configs.keys())
+    try:
+        initial_index = mode_keys.index(processing_mode)
+    except ValueError:
+        initial_index = 0
+    selected_index = initial_index
+
+    for i, mode in enumerate(mode_keys):
+        btn = ctk.CTkButton(
+            scrollable_frame,
+            text=mode,
+            command=lambda m=mode: select_mode(m)
+        )
+        btn.pack(fill="x", padx=5, pady=2)
+        buttons.append(btn)
+
+    # --- 6. Первичная отрисовка и ЗАХВАТ ФОКУСА ---
+    if buttons:
+        # Устанавливаем фокус на активный элемент
+        buttons[selected_index].focus_set()
+        # Вызываем подсветку
+        update_selection(selected_index)
+
+    # Надежный способ захвата фокуса для Tkinter
+    window.after(50, lambda: [window.iconify(), window.deiconify()])
+    if buttons:
+        window.after(100, lambda: buttons[selected_index].focus_set())
+
+    window.mainloop()
+
+
+def on_press(key):
+    """Handles key press events from the listener."""
+    try:
+        if key == keyboard.Key.f9:
+            on_f9_press()
+        elif key == keyboard.Key.f10:
+            on_f10_press()
+    except Exception as e:
+        logging.error(f"Unhandled exception in on_press: {e}", exc_info=True)
+
+def on_release(key):
+    """Handles key release events from the listener."""
+    try:
+        if key == keyboard.Key.f9:
+            on_f9_release()
+    except Exception as e:
+        logging.error(f"Unhandled exception in on_release: {e}", exc_info=True)
+
+
+# --- Функции-обработчики для hotkey ---
+def on_f9_press():
+    """Обработчик НАЖАТИЯ F9."""
+    global is_recording, recording_thread
+    logging.debug("Событие НАЖАТИЯ F9 обнаружено.")
+    if not is_recording:
+        play_sound_async('start.wav')
+        is_recording = True
+        recording_thread = threading.Thread(target=start_recording_thread_target, name="RecordingStartThread", daemon=True)
+        recording_thread.start()
+        # Добавляем минимальную задержку для предотвращения гонки состояний
+        time.sleep(0.1)
+    else:
+        logging.debug("Нажатие F9: Запись уже идет, игнорируем.")
+
+
+def on_f9_release():
+    """Обработчик ОТПУСКАНИЯ F9."""
+    global is_recording, processing_thread
+    logging.debug("Событие ОТПУСКАНИЯ F9 обнаружено.")
+    if is_recording:
+        play_sound_async('stop.wav')
+        is_recording = False
+        processing_thread = threading.Thread(target=stop_recording_and_transcribe_thread_target, name="ProcessingThread", daemon=True)
+        processing_thread.start()
+    else:
+        logging.debug("Отпускание F9: Запись не шла, игнорируем.")
+
+def on_f10_press():
+    """Обработчик НАЖАТИЯ F10 для открытия окна настроек."""
+    global is_settings_window_open
+    logging.debug("Событие НАЖАТИЯ F10 обнаружено.")
+
+    if is_settings_window_open:
+        logging.debug("Окно настроек уже открыто, игнорируем.")
+        return
+
+    settings_thread = threading.Thread(target=open_settings_window, name="SettingsWindowThread", daemon=True)
+    settings_thread.start()
+
+# --- Основная часть ---
+if __name__ == "__main__":
+    prompt_configs = load_prompts(PROMPT_FILE)
+    if not prompt_configs:
+        logging.warning("Промпты не были загружены. Функционал GPT будет ограничен.")
+    else:
+        # Устанавливаем режим по умолчанию на первый ключ из конфига, если он есть
+        processing_mode = next(iter(prompt_configs))
+        logging.info(f"Загружено {len(prompt_configs)} режимов обработки. Режим по умолчанию: '{processing_mode}'")
+
+    # Блок вывода устройств можно оставить INFO или закомментировать, т.к. он только при старте
+    try:
+        logging.info("Инициализация: Доступные аудиоустройства:")
+        print("--------------------")
+        print(sd.query_devices())
+        print("--------------------")
+        # ... (остальная логика определения устройства) ...
+    except Exception as e:
+        logging.error(f"Инициализация: Ошибка при запросе аудиоустройств: {e}")
+
+    # Инициализация клиента OpenAI, если есть ключи
+    if OPENAI_API_KEY and OPENAI_API_BASE:
+        logging.info("Инициализация: Настройка клиента OpenAI...")
+        try:
+            gpt_client = openai.OpenAI(
+                api_key=OPENAI_API_KEY,
+                base_url=OPENAI_API_BASE,
+            )
+            logging.info("Инициализация: Клиент OpenAI успешно настроен.")
+        except Exception as e:
+            logging.error(f"Инициализация: Не удалось настроить клиент OpenAI: {e}")
+    else:
+        logging.warning("Инициализация: Ключи OpenAI не найдены в .env, коррекция GPT будет пропущена.")
+
+    logging.info(f"Инициализация: Проверка доступности GPU... Устройство для вычислений: {DEVICE.upper()}")
+    logging.info("Инициализация: Загрузка модели Whisper...")
+    try:
+        model = whisper.load_model(MODEL_SIZE, device=DEVICE)
+        logging.info(f"Инициализация: Модель '{MODEL_SIZE}' загружена на устройство: {DEVICE}")
+
+        # --- "ПРОГРЕВ" МОДЕЛИ ---
+        logging.info("Инициализация: Выполнение 'прогрева' модели для ускорения первого запуска...")
+        # Создаем 1 секунду тишины
+        dummy_audio = np.zeros(SAMPLE_RATE, dtype=np.float32)
+        # Распознаем тишину
+        model.transcribe(dummy_audio, fp16=(DEVICE == 'cuda' and not FORCE_FP32))
+        logging.info("Инициализация: Модель 'прогрета' и готова к работе.")
+        # --- КОНЕЦ "ПРОГРЕВА" ---
+    except Exception as e:
+        logging.error(f"Инициализация: Не удалось загрузить модель Whisper: {e}", exc_info=True)
+        exit(1)
+
+    logging.info("Инициализация: Запуск слушателя горячих клавиш...")
+    # Listener is defined here and started. It will be stopped in the finally block.
+    listener = keyboard.Listener(on_press=on_press, on_release=on_release)
+    listener.start()
+    logging.info(f"Инициализация: Слушатель горячих клавиш запущен. F9 - запись, F10 - настройки.")
+
+    logging.info(f"=== Скрипт готов. F9 - запись голоса, F10 - настройки. ===")
+    if SAVE_AUDIO_FOR_DEBUG or FORCE_FP32 or TARGET_DEVICE_INDEX is not None:
+         logging.info(f"--- Активные отладочные настройки: SAVE_AUDIO={SAVE_AUDIO_FOR_DEBUG}, FORCE_FP32={FORCE_FP32}, DEVICE_INDEX={TARGET_DEVICE_INDEX} ---") # <--- INFO (только если есть)
+    logging.info("=== Чтобы остановить скрипт, нажмите Ctrl+C в консоли. ===") # <--- INFO
+
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        logging.info("Получен сигнал KeyboardInterrupt. Завершение работы...") # <--- INFO
+    except Exception as e:
+        logging.exception(f"Непредвиденная ошибка в главном цикле: {e}") # <--- ERROR
+    finally:
+        logging.info("Завершение: Остановка слушателя клавиатуры...")
+        listener.stop()
+        if is_recording and stream:
+            logging.warning("Завершение: Принудительная остановка аудиопотока...") # <--- WARNING
+            is_recording = False
+            try:
+                stream.stop()
+                stream.close()
+                logging.info("Завершение: Аудиопоток принудительно остановлен.") # <--- INFO
+            except Exception as e:
+                 logging.error(f"Завершение: Ошибка при принудительной остановке потока: {e}") # <--- ERROR
+        logging.info("=== Скрипт остановлен. ===") # <--- INFO

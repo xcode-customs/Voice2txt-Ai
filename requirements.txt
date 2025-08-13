@@ -1,0 +1,12 @@
+sounddevice
+numpy
+soundfile
+openai-whisper
+torch
+pynput
+openai
+pyperclip
+playsound==1.2.2
+python-dotenv
+customtkinter
+pyautogui
