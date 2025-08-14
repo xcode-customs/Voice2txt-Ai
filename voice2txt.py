@@ -61,7 +61,6 @@ gpt_client = None
 settings_window = None
 prompt_configs = {}
 processing_mode = "Коррекция"
-selected_index = 0
 recording_thread = None
 processing_thread = None
 
@@ -336,14 +335,29 @@ def reposition_window(window: ctk.CTk):
 
 
 def show_settings_window():
-    """Shows the existing settings window at the cursor's position."""
-    global settings_window
+    """Показывает существующее окно, обновляет его позицию и сбрасывает подсветку."""
+    global settings_window, processing_mode
     if not settings_window:
         return
 
-    reposition_window(settings_window)
+    reposition_window(settings_window) # Позиционируем, как и раньше
 
-    # --- Показываем и фокусируемся ---
+    # --- СБРОС И СИНХРОНИЗАЦИЯ СОСТОЯНИЯ ---
+    # 1. Получаем список кнопок (он был сохранен при создании)
+    buttons = settings_window.buttons
+    mode_keys = settings_window.mode_keys
+
+    # 2. Находим АКТУАЛЬНЫЙ индекс на основе "источника правды"
+    try:
+        current_index = mode_keys.index(processing_mode)
+    except ValueError:
+        current_index = 0
+
+    # 3. Вызываем функцию подсветки, чтобы перерисовать окно
+    settings_window.update_selection(current_index)
+    # --- КОНЕЦ СИНХРОНИЗАЦИИ ---
+
+    # Показываем и фокусируемся
     settings_window.deiconify()
     settings_window.lift()
     settings_window.focus_force()
@@ -351,26 +365,18 @@ def show_settings_window():
 
 def create_settings_window():
     """Создает и управляет окном настроек, реализуя навигацию и подсветку."""
-    global settings_window, processing_mode, selected_index
+    global settings_window, processing_mode
 
-    # --- 1. Создание и позиционирование окна ---
+    # --- 1. Создание и базовые настройки окна ---
     window = ctk.CTk()
     window.title("Настройки")
-
-    reposition_window(window)
-
     window.attributes("-topmost", True)
-    settings_window = window
+    settings_window = window  # Регистрируем окно глобально
 
-    # --- 2. Централизованная функция закрытия ---
-    def on_closing():
-        logging.debug("Прячем окно настроек.")
-        window.withdraw()  # Прячем, а не уничтожаем
-
-    window.protocol("WM_DELETE_WINDOW", on_closing)
-
-    # --- 3. Логика подсветки и навигации ---
+    # --- 2. Локальные переменные и вложенные функции ---
+    selected_index = 0  # Локальная переменная для временного состояния навигации
     buttons = []
+
     try:
         DEFAULT_COLOR = ctk.ThemeManager.theme["CTkButton"]["fg_color"]
         ACCENT_COLOR = ctk.ThemeManager.theme["CTkButton"]["hover_color"]
@@ -380,7 +386,7 @@ def create_settings_window():
         ACCENT_COLOR = "#36719F"
 
     def update_selection(new_index):
-        global selected_index
+        nonlocal selected_index
         if not buttons: return
 
         for i, btn in enumerate(buttons):
@@ -392,15 +398,18 @@ def create_settings_window():
         selected_index = new_index
         buttons[selected_index].focus_set()
 
-    # --- 4. Функция выбора и обработчики клавиш ---
+    def on_closing():
+        logging.debug("Прячем окно настроек.")
+        window.withdraw()  # Прячем, а не уничтожаем
+
     def select_mode(mode_name):
         global processing_mode
         processing_mode = mode_name
         logging.info(f"Режим изменен на '{mode_name}'.")
-        on_closing()  # Вызываем общую функцию, которая спрячет окно
+        on_closing()
 
     def handle_key_press(event):
-        global selected_index
+        nonlocal selected_index
         if not buttons: return
 
         if event.keysym == 'Down':
@@ -412,23 +421,23 @@ def create_settings_window():
         elif event.keysym == 'Escape':
             on_closing()
 
+    # --- 3. Привязка обработчиков и данных к объекту окна ---
+    window.protocol("WM_DELETE_WINDOW", on_closing)
     window.bind("<Up>", handle_key_press)
     window.bind("<Down>", handle_key_press)
     window.bind("<Return>", handle_key_press)
     window.bind("<Escape>", handle_key_press)
 
-    # --- 5. Создание виджетов ---
+    # Прикрепляем важные данные к объекту окна для доступа извне
+    window.buttons = buttons
+    window.mode_keys = list(prompt_configs.keys())
+    window.update_selection = update_selection
+
+    # --- 4. Создание виджетов ---
     scrollable_frame = ctk.CTkScrollableFrame(window, fg_color="transparent")
     scrollable_frame.pack(fill="both", expand=True, padx=5, pady=5)
 
-    mode_keys = list(prompt_configs.keys())
-    try:
-        initial_index = mode_keys.index(processing_mode)
-    except ValueError:
-        initial_index = 0
-    selected_index = initial_index
-
-    for i, mode in enumerate(mode_keys):
+    for mode in window.mode_keys:
         btn = ctk.CTkButton(
             scrollable_frame,
             text=mode,
@@ -437,17 +446,9 @@ def create_settings_window():
         btn.pack(fill="x", padx=5, pady=2)
         buttons.append(btn)
 
-    # --- 6. Первичная отрисовка и ЗАХВАТ ФОКУСА ---
-    if buttons:
-        # Устанавливаем фокус на активный элемент
-        buttons[selected_index].focus_set()
-        # Вызываем подсветку
-        update_selection(selected_index)
-
-    # Надежный способ захвата фокуса для Tkinter
-    window.after(50, lambda: [window.iconify(), window.deiconify()])
-    if buttons:
-        window.after(100, lambda: buttons[selected_index].focus_set())
+    # --- 5. Первичный показ окна ---
+    # Позиционирование и подсветка теперь полностью управляются `show_settings_window`
+    show_settings_window()
 
     window.mainloop()
 
