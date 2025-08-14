@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 import customtkinter as ctk
 import json
 import pyautogui
+from screeninfo import get_monitors
 
 try:
     from pynput.mouse import Controller as MouseController
@@ -281,38 +282,66 @@ def stop_recording_and_transcribe_thread_target():
         logging.debug("Поток обработки завершен.")
 
 
+def reposition_window(window: ctk.CTk):
+    """Calculates and applies the optimal window position based on monitor configuration."""
+    WIN_WIDTH = 400
+    WIN_HEIGHT = 350
+
+    if PYNPUT_AVAILABLE:
+        try:
+            # 1. Получаем позицию мыши и список всех мониторов
+            mouse_controller = MouseController()
+            mouse_x, mouse_y = mouse_controller.position
+            monitors = get_monitors()
+
+            # 2. Находим, на каком мониторе сейчас курсор
+            current_monitor = None
+            for monitor in monitors:
+                if monitor.x <= mouse_x < monitor.x + monitor.width and \
+                   monitor.y <= mouse_y < monitor.y + monitor.height:
+                    current_monitor = monitor
+                    break
+
+            # Если по какой-то причине не нашли, используем основной
+            if current_monitor is None:
+                current_monitor = next(m for m in monitors if m.is_primary)
+
+            # 3. Рассчитываем позицию ОТНОСИТЕЛЬНО АКТИВНОГО МОНИТОРА
+            # Логика по оси X
+            if mouse_x + WIN_WIDTH > current_monitor.x + current_monitor.width:
+                final_x = mouse_x - WIN_WIDTH - 20
+            else:
+                final_x = mouse_x + 20
+
+            # Логика по оси Y
+            if mouse_y + WIN_HEIGHT > current_monitor.y + current_monitor.height:
+                final_y = mouse_y - WIN_HEIGHT - 20
+            else:
+                final_y = mouse_y + 20
+
+            # 4. Применяем геометрию. Удаляем max(0, ...), так как X и Y могут быть отрицательными
+            window.geometry(f"{WIN_WIDTH}x{WIN_HEIGHT}+{final_x}+{final_y}")
+
+        except Exception as e:
+            logging.warning(f"Ошибка при позиционировании окна: {e}. Окно будет центрировано.")
+            # Центрируем окно, если что-то пошло не так
+            screen_width = window.winfo_screenwidth()
+            screen_height = window.winfo_screenheight()
+            center_x = (screen_width - WIN_WIDTH) // 2
+            center_y = (screen_height - WIN_HEIGHT) // 2
+            window.geometry(f"{WIN_WIDTH}x{WIN_HEIGHT}+{center_x}+{center_y}")
+    else:
+        # Fallback, если pynput недоступен
+        window.geometry(f"{WIN_WIDTH}x{WIN_HEIGHT}")
+
+
 def show_settings_window():
     """Shows the existing settings window at the cursor's position."""
     global settings_window
     if not settings_window:
         return
 
-    # --- Интеллектуальное позиционирование ---
-    WIN_WIDTH = 400
-    WIN_HEIGHT = 350
-
-    if PYNPUT_AVAILABLE:
-        try:
-            screen_width = settings_window.winfo_screenwidth()
-            screen_height = settings_window.winfo_screenheight()
-            mouse_controller = MouseController()
-            mouse_x, mouse_y = mouse_controller.position
-
-            if mouse_x + WIN_WIDTH > screen_width:
-                final_x = mouse_x - WIN_WIDTH - 20
-            else:
-                final_x = mouse_x + 20
-
-            if mouse_y + WIN_HEIGHT > screen_height:
-                final_y = mouse_y - WIN_HEIGHT - 20
-            else:
-                final_y = mouse_y + 20
-
-            final_x = max(0, final_x)
-            final_y = max(0, final_y)
-            settings_window.geometry(f"{WIN_WIDTH}x{WIN_HEIGHT}+{final_x}+{final_y}")
-        except Exception as e:
-            logging.warning(f"Не удалось обновить позицию окна, оно появится в прежнем месте: {e}")
+    reposition_window(settings_window)
 
     # --- Показываем и фокусируемся ---
     settings_window.deiconify()
@@ -328,42 +357,7 @@ def create_settings_window():
     window = ctk.CTk()
     window.title("Настройки")
 
-    # --- Интеллектуальное позиционирование ---
-    WIN_WIDTH = 400
-    WIN_HEIGHT = 350
-
-    # Позиционирование у мыши (с проверкой на наличие pynput)
-    if PYNPUT_AVAILABLE:
-        try:
-            # 1. Получаем размеры экрана и позицию мыши
-            screen_width = window.winfo_screenwidth()
-            screen_height = window.winfo_screenheight()
-            mouse_controller = MouseController()
-            mouse_x, mouse_y = mouse_controller.position
-
-            # 2. Рассчитываем финальную позицию X
-            if mouse_x + WIN_WIDTH > screen_width:
-                final_x = mouse_x - WIN_WIDTH - 20  # Появляется слева
-            else:
-                final_x = mouse_x + 20  # Появляется справа
-
-            # 3. Рассчитываем финальную позицию Y
-            if mouse_y + WIN_HEIGHT > screen_height:
-                final_y = mouse_y - WIN_HEIGHT - 20  # Появляется сверху
-            else:
-                final_y = mouse_y + 20  # Появляется снизу
-
-            # 4. Применяем геометрию, гарантируя, что окно не уходит за левый/верхний край
-            final_x = max(0, final_x)
-            final_y = max(0, final_y)
-            window.geometry(f"{WIN_WIDTH}x{WIN_HEIGHT}+{final_x}+{final_y}")
-
-        except Exception as e:
-            logging.warning(f"Не удалось получить координаты мыши, окно появится по центру: {e}")
-            window.geometry(f"{WIN_WIDTH}x{WIN_HEIGHT}")
-    else:
-        # Fallback to center if pynput is not available
-        window.geometry(f"{WIN_WIDTH}x{WIN_HEIGHT}")
+    reposition_window(window)
 
     window.attributes("-topmost", True)
     settings_window = window
