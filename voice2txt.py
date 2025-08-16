@@ -18,6 +18,8 @@ import customtkinter as ctk
 import json
 import pyautogui
 from screeninfo import get_monitors
+import ctypes
+from ctypes import wintypes
 
 try:
     from pynput.mouse import Controller as MouseController
@@ -126,17 +128,86 @@ def process_text_with_gpt(text: str) -> str:
         return text
 
 
+# --- Новые структуры и константы для SendInput ---
+# Определяем структуры, которые использует SendInput
+PUL = ctypes.POINTER(ctypes.c_ulong)
+
+
+class KeyBdInput(ctypes.Structure):
+    _fields_ = [("wVk", ctypes.c_ushort),
+                ("wScan", ctypes.c_ushort),
+                ("dwFlags", ctypes.c_ulong),
+                ("time", ctypes.c_ulong),
+                ("dwExtraInfo", PUL)]
+
+
+class HardwareInput(ctypes.Structure):
+    _fields_ = [("uMsg", ctypes.c_ulong),
+                ("wParamL", ctypes.c_short),
+                ("wParamH", ctypes.c_ushort)]
+
+
+class MouseInput(ctypes.Structure):
+    _fields_ = [("dx", ctypes.c_long),
+                ("dy", ctypes.c_long),
+                ("mouseData", ctypes.c_ulong),
+                ("dwFlags", ctypes.c_ulong),
+                ("time", ctypes.c_ulong),
+                ("dwExtraInfo", PUL)]
+
+
+class Input_I(ctypes.Union):
+    _fields_ = [("ki", KeyBdInput),
+                ("mi", MouseInput),
+                ("hi", HardwareInput)]
+
+
+class Input(ctypes.Structure):
+    _fields_ = [("type", ctypes.c_ulong),
+                ("ii", Input_I)]
+
+
+# ----------------------------------------------------
+
 def paste_text(text: str):
-    """Копирует текст в буфер и симулирует вставку (Ctrl+V или Cmd+V)."""
+    """Копирует текст в буфер и симулирует вставку, используя наилучший метод для текущей ОС."""
     try:
         pyperclip.copy(text)
-        time.sleep(0.1)  # Пауза для буфера обмена
-
+        time.sleep(0.1)
         logging.debug("Отправка команды вставки...")
-        pyautogui.hotkey('ctrl', 'v')  # Для Windows/Linux
-        # Примечание: для macOS pyautogui автоматически преобразует 'ctrl' в 'command'
 
-        logging.debug("Команда вставки отправлена.")
+        if os.name == 'nt':  # Проверка, что это Windows
+            # --- Метод SendInput (самый надежный) ---
+
+            # Виртуальные коды клавиш
+            VK_CONTROL = 0x11
+            VK_V = 0x56
+
+            # Создаем события нажатия
+            ip = Input_I()
+            ip.ki = KeyBdInput(VK_CONTROL, 0, 0, 0, None)
+            ctrl_down = Input(ctypes.c_ulong(1), ip)
+
+            ip.ki = KeyBdInput(VK_V, 0, 0, 0, None)
+            v_down = Input(ctypes.c_ulong(1), ip)
+
+            # Создаем события отпускания
+            ip.ki = KeyBdInput(VK_V, 0, 2, 0, None)  # KEYEVENTF_KEYUP = 2
+            v_up = Input(ctypes.c_ulong(1), ip)
+
+            ip.ki = KeyBdInput(VK_CONTROL, 0, 2, 0, None)
+            ctrl_up = Input(ctypes.c_ulong(1), ip)
+
+            # Собираем все в один массив
+            inputs = (Input * 4)(ctrl_down, v_down, v_up, ctrl_up)
+
+            # Отправляем события
+            ctypes.windll.user32.SendInput(4, ctypes.pointer(inputs), ctypes.sizeof(Input))
+
+            logging.debug("Команда вставки отправлена через SendInput.")
+
+        else:  # Для macOS, Linux и других систем
+            pyautogui.hotkey('ctrl', 'v')
 
     except Exception as e:
         logging.error(f"Ошибка при копировании/вставке: {e}", exc_info=True)
